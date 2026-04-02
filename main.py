@@ -1,8 +1,11 @@
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
-from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from jose import JWTError, jwt
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="SmartCanteen API")
@@ -18,6 +21,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------
+# JWT настройки
+# ---------------------------------
+SECRET_KEY = "smartcanteen_super_secret_key_change_me"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+security = HTTPBearer()
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 
 
 # ---------------------------------
@@ -52,9 +66,14 @@ class Dish(DishBase):
 # ---------------------------------
 # Модели заказов
 # ---------------------------------
-class Order(BaseModel):
-    user: str = Field(..., min_length=2, max_length=100)
+class OrderCreate(BaseModel):
     dishes: List[int] = Field(..., min_length=1)
+
+
+class Order(BaseModel):
+    id: int
+    user: str
+    dishes: List[int]
 
 
 # ---------------------------------
@@ -74,6 +93,13 @@ class LoginRequest(BaseModel):
 class AuthResponse(BaseModel):
     access_token: str
     token_type: str
+    username: str
+    email: str
+    role: str
+
+
+class UserInfo(BaseModel):
+    id: int
     username: str
     email: str
     role: str
@@ -119,12 +145,10 @@ users = [
         "id": 1,
         "username": "admin",
         "email": "admin@smartcanteen.ru",
-        "password": "12345",
+        "password": pwd_context.hash("12345"),
         "role": "admin",
     }
 ]
-
-tokens = {}
 
 
 # ---------------------------------
@@ -151,12 +175,95 @@ def find_user_by_email(email: str):
     return None
 
 
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def build_auth_response(user: dict):
+    token = create_access_token(
+        {
+            "sub": user["username"],
+            "email": user["email"],
+            "role": user["role"],
+        }
+    )
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "username": user["username"],
+        "email": user["email"],
+        "role": user["role"],
+    }
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+):
+    token = credentials.credentials
+
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Недействительный или просроченный токен",
+    )
+
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        username: Optional[str] = payload.get("sub")
+
+        if username is None:
+            raise credentials_exception
+
+    except JWTError:
+        raise credentials_exception
+
+    user = find_user_by_username(username)
+    if user is None:
+        raise credentials_exception
+
+    return user
+
+
+def get_current_admin(current_user: dict = Depends(get_current_user)):
+    if current_user["role"] != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Доступ запрещен: требуется роль администратора",
+        )
+    return current_user
+
+
 # ---------------------------------
 # Базовый маршрут
 # ---------------------------------
 @app.get("/")
 def home():
     return {"message": "SmartCanteen API работает"}
+
+
+# ---------------------------------
+# Пользователь
+# ---------------------------------
+@app.get("/me", response_model=UserInfo)
+def read_current_user(current_user: dict = Depends(get_current_user)):
+    return {
+        "id": current_user["id"],
+        "username": current_user["username"],
+        "email": current_user["email"],
+        "role": current_user["role"],
+    }
 
 
 # ---------------------------------
@@ -176,7 +283,7 @@ def get_dish(dish_id: int):
 
 
 @app.post("/dishes", response_model=Dish, status_code=201)
-def create_dish(dish: DishCreate):
+def create_dish(dish: DishCreate, admin_user: dict = Depends(get_current_admin)):
     for existing_dish in dishes:
         if existing_dish["name"].lower() == dish.name.lower():
             raise HTTPException(status_code=400, detail="Блюдо с таким названием уже существует")
@@ -188,7 +295,11 @@ def create_dish(dish: DishCreate):
 
 
 @app.put("/dishes/{dish_id}", response_model=Dish)
-def update_dish(dish_id: int, updated_dish: DishUpdate):
+def update_dish(
+    dish_id: int,
+    updated_dish: DishUpdate,
+    admin_user: dict = Depends(get_current_admin),
+):
     dish = find_dish_by_id(dish_id)
     if dish is None:
         raise HTTPException(status_code=404, detail="Блюдо не найдено")
@@ -205,7 +316,7 @@ def update_dish(dish_id: int, updated_dish: DishUpdate):
 
 
 @app.delete("/dishes/{dish_id}")
-def delete_dish(dish_id: int):
+def delete_dish(dish_id: int, admin_user: dict = Depends(get_current_admin)):
     dish = find_dish_by_id(dish_id)
     if dish is None:
         raise HTTPException(status_code=404, detail="Блюдо не найдено")
@@ -218,22 +329,26 @@ def delete_dish(dish_id: int):
 # Заказы
 # ---------------------------------
 @app.get("/orders")
-def get_orders():
+def get_orders(admin_user: dict = Depends(get_current_admin)):
     return orders
 
 
 @app.post("/orders")
-def create_order(order: Order):
+def create_order(order: OrderCreate, current_user: dict = Depends(get_current_user)):
     for dish_id in order.dishes:
         if find_dish_by_id(dish_id) is None:
             raise HTTPException(status_code=404, detail=f"Блюдо с id={dish_id} не найдено")
 
-    new_order = order.model_dump()
+    new_order = {
+        "id": max([o["id"] for o in orders], default=0) + 1,
+        "user": current_user["username"],
+        "dishes": order.dishes,
+    }
     orders.append(new_order)
 
     return {
         "message": "Заказ успешно создан",
-        "order": new_order
+        "order": new_order,
     }
 
 
@@ -252,48 +367,22 @@ def register(user_data: RegisterRequest):
         "id": max([u["id"] for u in users], default=0) + 1,
         "username": user_data.username,
         "email": user_data.email,
-        "password": user_data.password,
+        "password": get_password_hash(user_data.password),
         "role": "user",
     }
     users.append(new_user)
 
-    token = str(uuid4())
-    tokens[token] = {
-        "username": new_user["username"],
-        "email": new_user["email"],
-        "role": new_user["role"],
-    }
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": new_user["username"],
-        "email": new_user["email"],
-        "role": new_user["role"],
-    }
+    return build_auth_response(new_user)
 
 
 @app.post("/login", response_model=AuthResponse)
 def login(login_data: LoginRequest):
     user = find_user_by_username(login_data.username)
 
-    if user is None or user["password"] != login_data.password:
+    if user is None or not verify_password(login_data.password, user["password"]):
         raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
-    token = str(uuid4())
-    tokens[token] = {
-        "username": user["username"],
-        "email": user["email"],
-        "role": user["role"],
-    }
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "username": user["username"],
-        "email": user["email"],
-        "role": user["role"],
-    }
+    return build_auth_response(user)
 
 
 # uvicorn main:app --reload
