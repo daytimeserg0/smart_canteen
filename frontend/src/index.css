@@ -637,3 +637,15 @@ button {
 .auth-form .btn {
   width: 100%;
 }
+
+.admin-textarea {
+  height: 48px;
+  resize: none;
+  overflow-y: auto;
+  box-sizing: border-box;
+  font: inherit;
+  line-height: 1.2;
+  padding: 12px 18px;
+  margin: 0;
+  vertical-align: middle;
+}
