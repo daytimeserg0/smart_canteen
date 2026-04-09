@@ -121,20 +121,6 @@ http://localhost:5173
 
 ---
 
-## Архитектура системы
-
-```
-Frontend (React)
-        │
-        ▼
-Backend API (FastAPI)
-        │
-        ▼
-PostgreSQL
-        │
-        ▼
-ML модель (CatBoost)
-```
 
 ---
 
