@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { getDishes } from "../api";
+import { getDishes, getRecommendations } from "../api";
 import DishCard from "../components/DishCard";
 import { DISH_CATEGORIES } from "../data/categories";
+import { useAuth } from "../context/AuthContext";
 
 function MenuPage() {
+  const { token } = useAuth();
+
   const [dishes, setDishes] = useState([]);
   const [search, setSearch] = useState("");
   const [selectedCategory, setSelectedCategory] = useState("all");
@@ -15,7 +18,14 @@ function MenuPage() {
       try {
         setLoading(true);
         setError("");
-        const data = await getDishes();
+
+        let data;
+        if (token) {
+          data = await getRecommendations(token);
+        } else {
+          data = await getDishes();
+        }
+
         setDishes(data);
       } catch (err) {
         setError(err.message || "Не удалось загрузить блюда");
@@ -25,7 +35,7 @@ function MenuPage() {
     };
 
     loadDishes();
-  }, []);
+  }, [token]);
 
   const filteredDishes = useMemo(() => {
     return dishes.filter((dish) => {

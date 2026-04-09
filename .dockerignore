@@ -1,0 +1,10 @@
+pycache
+*.pyc
+*.pyo
+*.pyd
+.venv
+venv
+.env
+logs
+frontend/node_modules
+frontend/dist

@@ -3,14 +3,17 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Generator, List, Optional
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
+import pandas as pd
+from catboost import CatBoostClassifier
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from pydantic import BaseModel, EmailStr, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -24,16 +27,22 @@ from sqlalchemy import (
     create_engine,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
-from sqlalchemy.orm import declarative_base, relationship, sessionmaker, Session
+from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 app = FastAPI(title="SmartCanteen API")
 
 # ---------------------------------
-# Пути для загрузки изображений
+# Пути
 # ---------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 UPLOADS_DIR = BASE_DIR / "uploads"
 UPLOADS_DIR.mkdir(exist_ok=True)
+
+MODEL_PATH = BASE_DIR / "dish_ranker.cbm"
+ranking_model: Optional[CatBoostClassifier] = None
+
+MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+STRICT_DIETS = {"vegetarian", "vegan", "glutenFree", "lactoseFree", "halal"}
 
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
@@ -346,6 +355,249 @@ def order_to_response(order: OrderDB) -> Order:
     )
 
 
+# ---------------------------------
+# Правила тегов блюда
+# ---------------------------------
+def infer_allergen_tags(ingredients: List[str], allergen_warning: str) -> List[str]:
+    text_blob = " ".join(ingredients).lower() + " " + (allergen_warning or "").lower()
+
+    rules = {
+        "milk": [
+            "молок", "молочный",
+            "сыр", "фета", "брынз",
+            "слив", "сливки",
+            "сметан", "сметана",
+            "твор", "творог",
+            "йогурт",
+            "кефир",
+            "морожен",
+            "капучино", "латте",
+            "крем",
+        ],
+        "eggs": [
+            "яйц", "яйцо", "яйца",
+            "омлет",
+            "майонез",
+        ],
+        "nuts": [
+            "орех", "орехи",
+            "миндаль",
+            "фундук",
+            "грецк",
+            "грецкие",
+        ],
+        "peanuts": [
+            "арахис",
+        ],
+        "fish": [
+            "рыб", "рыба",
+            "тунец",
+            "уха",
+            "лосось",
+            "треск",
+            "филе рыбы",
+        ],
+        "seafood": [
+            "морепродукт",
+            "кревет",
+            "мид",
+            "кальмар",
+        ],
+        "soy": [
+            "соя", "соев", "соус терияки", "терияки",
+        ],
+        "gluten": [
+            "мука",
+            "лапша",
+            "макарон", "макароны",
+            "хлеб",
+            "булка", "булоч",
+            "сухар", "сухарики",
+            "блин", "блины", "блинчики",
+            "овсян", "овсяные хлопья",
+            "перлов",
+            "булгур",
+            "лазань", "листы лазаньи",
+            "манка",
+            "печенье",
+            "круассан",
+        ],
+        "sesame": [
+            "кунжут",
+        ],
+    }
+
+    found = []
+    for tag, keywords in rules.items():
+        if any(word in text_blob for word in keywords):
+            found.append(tag)
+
+    return sorted(set(found))
+
+
+def infer_diet_tags(category: str, ingredients: List[str], allergen_warning: str, calories: int) -> List[str]:
+    text_blob = " ".join(ingredients).lower() + " " + (allergen_warning or "").lower()
+
+    has_meat = any(
+        word in text_blob
+        for word in [
+            "говяд", "говядин",
+            "свин", "свинин",
+            "куриц", "курица", "куриное", "куриный", "куриное филе", "куриный фарш",
+            "индейк", "индейка",
+            "бекон",
+            "ветчин", "ветчина",
+            "мяс", "мясо",
+            "котлет",
+            "тефтел", "тефтели",
+            "фрикадель",
+            "сосиск", "сосиска",
+            "колбас", "колбаса",
+            "фарш",
+            "плов с курицей",
+            "курица с тушёной капустой",
+        ]
+    )
+
+    has_fish = any(
+        word in text_blob
+        for word in [
+            "рыб", "рыба",
+            "тунец",
+            "уха",
+            "лосось",
+            "треск",
+            "филе рыбы",
+        ]
+    )
+
+    has_seafood = any(
+        word in text_blob
+        for word in [
+            "кревет",
+            "мид",
+            "кальмар",
+            "морепродукт",
+        ]
+    )
+
+    has_milk = any(
+        word in text_blob
+        for word in [
+            "молок", "молочный",
+            "сыр", "фета", "брынз",
+            "слив", "сливки",
+            "сметан", "сметана",
+            "твор", "творог",
+            "йогурт",
+            "кефир",
+            "морожен",
+            "капучино", "латте",
+            "крем",
+        ]
+    )
+
+    has_eggs = any(
+        word in text_blob
+        for word in [
+            "яйц", "яйцо", "яйца",
+            "омлет",
+            "майонез",
+        ]
+    )
+
+    has_gluten = any(
+        word in text_blob
+        for word in [
+            "мука",
+            "лапша",
+            "макарон", "макароны",
+            "хлеб",
+            "булка", "булоч",
+            "сухар", "сухарики",
+            "блин", "блины", "блинчики",
+            "овсян", "овсяные хлопья",
+            "перлов",
+            "булгур",
+            "лазань", "листы лазаньи",
+            "манка",
+            "печенье",
+            "круассан",
+        ]
+    )
+
+    has_pork = any(
+        word in text_blob
+        for word in [
+            "свин", "свинин",
+            "бекон",
+            "ветчин", "ветчина",
+        ]
+    )
+
+    tags = []
+
+    if not has_meat and not has_fish and not has_seafood:
+        tags.append("vegetarian")
+
+    if not has_meat and not has_fish and not has_seafood and not has_milk and not has_eggs:
+        tags.append("vegan")
+
+    if not has_gluten:
+        tags.append("glutenFree")
+
+    if not has_milk:
+        tags.append("lactoseFree")
+
+    if calories <= 260:
+        tags.append("lowCalorie")
+
+    if category in {"main", "breakfast"} and calories >= 280 and category != "dessert":
+        tags.append("highProtein")
+
+    if calories <= 280 and category != "dessert":
+        tags.append("diabetic")
+
+    if not has_pork:
+        tags.append("halal")
+
+    return sorted(set(tags))
+
+
+def is_dish_allowed_for_user(user_diets: List[str], user_allergens: List[str], dish: DishDB) -> bool:
+    dish_allergens = infer_allergen_tags(dish.ingredients or [], dish.allergen_warning or "")
+    dish_diets = infer_diet_tags(
+        dish.category,
+        dish.ingredients or [],
+        dish.allergen_warning or "",
+        int(dish.calories),
+    )
+
+    if any(a in dish_allergens for a in user_allergens):
+        return False
+
+    for diet in user_diets:
+        if diet in STRICT_DIETS and diet not in dish_diets:
+            return False
+
+    return True
+
+
+def get_moscow_context():
+    now = datetime.now(MOSCOW_TZ)
+    weekday = now.strftime("%A").lower()
+    hour = now.hour
+
+    if 6 <= hour <= 10:
+        time_of_day = "breakfast"
+    elif 11 <= hour <= 15:
+        time_of_day = "lunch"
+    else:
+        time_of_day = "dinner"
+
+    return weekday, hour, time_of_day
+
+
 def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
@@ -386,6 +638,8 @@ def get_current_admin(current_user: UserDB = Depends(get_current_user)):
 # ---------------------------------
 @app.on_event("startup")
 def startup():
+    global ranking_model
+
     Base.metadata.create_all(bind=engine)
 
     db = SessionLocal()
@@ -402,47 +656,15 @@ def startup():
             )
             db.add(admin)
             db.commit()
-
-        if db.query(DishDB).count() == 0:
-            sample_dishes = [
-                DishDB(
-                    name="Борщ",
-                    category="soup",
-                    calories=250,
-                    price=120,
-                    ingredients=["свекла", "мясо", "капуста"],
-                    description="Традиционный борщ с мясом и овощами.",
-                    allergen_warning="Может содержать следы глютена",
-                    image_url="https://images.unsplash.com/photo-1547592180-85f173990554",
-                    is_available=True,
-                ),
-                DishDB(
-                    name="Салат Цезарь",
-                    category="salad",
-                    calories=220,
-                    price=180,
-                    ingredients=["курица", "салат", "сыр", "соус"],
-                    description="Салат с курицей, сыром и фирменным соусом.",
-                    allergen_warning="Содержит молочные продукты",
-                    image_url="https://images.unsplash.com/photo-1546793665-c74683f339c1",
-                    is_available=True,
-                ),
-                DishDB(
-                    name="Компот",
-                    category="drink",
-                    calories=90,
-                    price=50,
-                    ingredients=["сухофрукты", "вода", "сахар"],
-                    description="Домашний компот из сухофруктов.",
-                    allergen_warning="Без основных аллергенов",
-                    image_url="https://images.unsplash.com/photo-1513558161293-cdaf765ed2fd",
-                    is_available=True,
-                ),
-            ]
-            db.add_all(sample_dishes)
-            db.commit()
     finally:
         db.close()
+
+    if MODEL_PATH.exists():
+        ranking_model = CatBoostClassifier()
+        ranking_model.load_model(str(MODEL_PATH))
+        print(f"Модель загружена: {MODEL_PATH}")
+    else:
+        print(f"Файл модели не найден: {MODEL_PATH}")
 
 
 # ---------------------------------
@@ -535,6 +757,60 @@ async def upload_image(
 def get_dishes(db: Session = Depends(get_db)):
     dishes = db.query(DishDB).order_by(DishDB.id.asc()).all()
     return [dish_to_response(dish) for dish in dishes]
+
+
+@app.get("/recommendations", response_model=List[Dish])
+def get_recommendations(
+    current_user: UserDB = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    dishes = (
+        db.query(DishDB)
+        .filter(DishDB.is_available == True)
+        .order_by(DishDB.id.asc())
+        .all()
+    )
+
+    allowed_dishes = [
+        dish for dish in dishes
+        if is_dish_allowed_for_user(
+            current_user.diet_types or [],
+            current_user.allergens or [],
+            dish,
+        )
+    ]
+
+    if not allowed_dishes:
+        return []
+
+    if ranking_model is None:
+        return [dish_to_response(dish) for dish in allowed_dishes]
+
+    weekday, _, time_of_day = get_moscow_context()
+
+    rows = []
+    for dish in allowed_dishes:
+        rows.append(
+            {
+                "user_id": current_user.id,
+                "dish_id": dish.id,
+                "category": dish.category,
+                "price": float(dish.price),
+                "calories": int(dish.calories),
+                "weekday": weekday,
+                "time_of_day": time_of_day,
+                "diet_types": ",".join(sorted(current_user.diet_types or [])),
+                "allergens": ",".join(sorted(current_user.allergens or [])),
+            }
+        )
+
+    pred_df = pd.DataFrame(rows)
+    scores = ranking_model.predict_proba(pred_df)[:, 1]
+
+    ranked = list(zip(allowed_dishes, scores))
+    ranked.sort(key=lambda x: x[1], reverse=True)
+
+    return [dish_to_response(dish) for dish, _ in ranked]
 
 
 @app.get("/dishes/{dish_id}", response_model=Dish)

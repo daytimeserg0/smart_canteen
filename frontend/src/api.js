@@ -48,6 +48,14 @@ export function getDishes() {
   return request("/dishes");
 }
 
+export function getRecommendations(token) {
+  return request("/recommendations", {
+    headers: {
+      Authorization: `Bearer ${token}`,
+    },
+  });
+}
+
 export function getDishById(id) {
   return request(`/dishes/${id}`);
 }

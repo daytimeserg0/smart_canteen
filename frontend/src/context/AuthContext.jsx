@@ -3,6 +3,42 @@ import { API_URL } from "../api";
 
 const AuthContext = createContext(null);
 
+function formatApiError(data, fallbackMessage) {
+  if (!data) {
+    return fallbackMessage;
+  }
+
+  if (typeof data.detail === "string") {
+    return data.detail;
+  }
+
+  if (Array.isArray(data.detail)) {
+    return data.detail
+      .map((item) => {
+        if (typeof item === "string") {
+          return item;
+        }
+
+        if (item?.msg) {
+          const field = Array.isArray(item.loc)
+            ? item.loc.slice(1).join(".")
+            : "";
+
+          return field ? `${field}: ${item.msg}` : item.msg;
+        }
+
+        return JSON.stringify(item);
+      })
+      .join("; ");
+  }
+
+  if (typeof data.detail === "object" && data.detail !== null) {
+    return JSON.stringify(data.detail);
+  }
+
+  return fallbackMessage;
+}
+
 export function AuthProvider({ children }) {
   const [authData, setAuthData] = useState(() => {
     const saved = localStorage.getItem("smartcanteen_auth");
@@ -26,10 +62,15 @@ export function AuthProvider({ children }) {
       body: JSON.stringify({ username, password }),
     });
 
-    const data = await response.json();
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
 
     if (!response.ok) {
-      throw new Error(data.detail || "Ошибка входа");
+      throw new Error(formatApiError(data, "Ошибка входа"));
     }
 
     setAuthData(data);
@@ -45,10 +86,15 @@ export function AuthProvider({ children }) {
       body: JSON.stringify({ username, email, password }),
     });
 
-    const data = await response.json();
+    let data = null;
+    try {
+      data = await response.json();
+    } catch {
+      data = null;
+    }
 
     if (!response.ok) {
-      throw new Error(data.detail || "Ошибка регистрации");
+      throw new Error(formatApiError(data, "Ошибка регистрации"));
     }
 
     setAuthData(data);
